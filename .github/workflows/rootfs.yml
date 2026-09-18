@@ -1,0 +1,150 @@
+name: Armbian rootfs cache (arm64 noble cli)
+
+# Builds Armbian's rootfs artifact on its own and parks it in a Release, so the
+# board repo's image build can download it instead of debootstrapping a Debian
+# userspace from scratch — that stage alone costs 20-40 minutes per build.
+#
+# ---------------------------------------------------------------------------
+# Why this lives in its own repo
+#
+# The rootfs cache name is
+#   rootfs-<ARCH>-<RELEASE>-<cache_type>_<yyyymm>-<AGGREGATED_ROOTFS_HASH>-H<hooks>-B<bash>
+# and carries NO board name. Measured on the same armbian/build revision:
+#
+#   BOARD=hz-evm-rk3588 (board repo overlay) -> de3dd0bda694-H6eccde-Bf1b6db / cli
+#   BOARD=rock-5b       (stock Armbian)      -> de3dd0bda694-H6eccde-Bf1b6db / cli
+#
+# Identical. A rootfs build never touches patch/kernel/ or patch/u-boot/, and even
+# a board's PACKAGE_LIST_BOARD lands in the *image*-level package set, not the
+# rootfs one. So this is a generic arm64/noble/cli artifact, not a board artifact,
+# and it does not belong in the board repo.
+#
+# ---------------------------------------------------------------------------
+# What invalidates a published tarball
+#
+#   yyyymm                 calendar month rolls over        -> monthly cron below
+#   AGGREGATED_ROOTFS_HASH upstream changes the package list
+#   B<bash>                hash of lib/functions/rootfs/{create-cache,rootfs-create}.sh
+#   cache_type             'cli' != 'minimal' != desktop variants
+#
+# The pinned SHA below is what keeps B<bash> and the package-list hash stable.
+# Bump it and you must re-run this workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Userspace release (noble / bookworm / trixie)"
+        required: false
+        default: "noble"
+      minimal:
+        description: "true = minimal CLI rootfs. Its cache name differs from the full CLI one."
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    # The cache name embeds `date +%Y%m`, so a tarball built in September can
+    # never be reused in October. Refresh on the 1st of every month.
+    - cron: '17 3 1 * *'
+
+env:
+  ARMBIAN_BUILD_SHA: 04108a20e5de1c956425b3f5a2a7cba47ba829b8
+  BOARD: hz-evm-rk3588
+  RELEASE_TAG: armbian-rootfs-cache
+
+jobs:
+  rootfs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Checkout Armbian build framework (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: armbian/build
+          ref: ${{ env.ARMBIAN_BUILD_SHA }}
+          path: armbian-build
+          fetch-depth: 1
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+                       /usr/local/lib/android /usr/share/swift 2>/dev/null || true
+          sudo apt-get -y purge azure-cli ghc* zulu* hhvm llvm* firefox \
+                       google* dotnet* powershell openjdk* moby* || true
+          sudo apt-get -y autoremove --purge
+          sudo apt-get clean
+          df -h
+
+      - name: Place board definition
+        run: |
+          # Only the board conf travels here, and only so the BOARD / parameter
+          # surface matches the image repo exactly. Nothing in it affects the
+          # rootfs cache id today (see the header comment); a rootfs build never
+          # reads patch/.
+          mkdir -p armbian-build/config/boards
+          cp config/boards/hz-evm-rk3588.conf armbian-build/config/boards/
+          ls -l armbian-build/config/boards/hz-evm-rk3588.conf
+
+      - name: Build rootfs artifact
+        working-directory: armbian-build
+        run: |
+          # The `rootfs` CLI subcommand builds (or fetches) just the rootfs
+          # artifact and stops. The old ROOT_FS_CREATE_ONLY=yes variable is
+          # deprecated and now errors out pointing at this subcommand.
+          # sudo is required: debootstrap + chroot + qemu binfmt.
+          sudo -E ./compile.sh rootfs \
+            BOARD=${{ env.BOARD }} \
+            BRANCH=current \
+            RELEASE=${{ github.event.inputs.release || 'noble' }} \
+            KERNEL_CONFIGURE=no \
+            BUILD_DESKTOP=no \
+            BUILD_MINIMAL=${{ github.event.inputs.minimal == 'true' && 'yes' || 'no' }} \
+            EXPERT=yes
+
+      - name: Collect rootfs tarball
+        run: |
+          ls -lh armbian-build/cache/rootfs/ || true
+          files=$(ls armbian-build/cache/rootfs/*.tar.zst 2>/dev/null || true)
+          if [ -z "$files" ]; then
+            echo "::error::No rootfs tarball was produced."
+            ls -lhR armbian-build/cache/ || true
+            exit 1
+          fi
+          # This name is the contract with the image repo: it only reuses the
+          # tarball when it computes exactly this id for itself.
+          for f in $files; do
+            echo "rootfs cache file: $(basename "$f")  bytes=$(stat -c%s "$f")"
+          done
+
+      - name: Publish rootfs cache to release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "Armbian rootfs cache (armbian/build @ ${{ env.ARMBIAN_BUILD_SHA }})"
+          body: |
+            Prebuilt Armbian **arm64 / noble / cli** rootfs tarball, consumed by
+            the board image build to skip the 20-40 minute rootfs stage.
+
+            - armbian/build pinned to `${{ env.ARMBIAN_BUILD_SHA }}`
+            - release `${{ github.event.inputs.release || 'noble' }}`
+            - minimal `${{ github.event.inputs.minimal || 'false' }}`
+
+            This artifact is **board-independent** — the cache id carries no board
+            name, and `BOARD=rock-5b` computes the same id as
+            `BOARD=hz-evm-rk3588` on this revision. Any arm64 board using
+            `RELEASE=noble` + full-CLI (`BUILD_MINIMAL=no`) can reuse it.
+
+            Consumers must (a) pin the same armbian/build revision and (b) match
+            release / BUILD_MINIMAL / BUILD_DESKTOP. The cache id also embeds the
+            current year+month, hence the monthly refresh.
+          files: |
+            armbian-build/cache/rootfs/*.tar.zst
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          prerelease: false
+          draft: false
